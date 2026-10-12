@@ -4,5 +4,7 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("Exanima Launcher")]
 [assembly: AssemblyProduct("Exanima Launcher")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyCompany("Orpheium")]
+[assembly: AssemblyCopyright("Orpheium")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]

@@ -73,13 +73,16 @@ namespace ExanimaLauncher
 
         public static RfiImage Decode(byte[] d)
         {
+            if (d.Length < 0x20) throw new InvalidDataException("file too short (" + d.Length + " bytes)");
             int w = BitConverter.ToInt32(d, 4), h = BitConverter.ToInt32(d, 8);
-            uint format = BitConverter.ToUInt32(d, 0x10) & 0x800cffff;
+            uint rawFormat = BitConverter.ToUInt32(d, 0x10), format = rawFormat & 0x800cffff;
             ushort flags = BitConverter.ToUInt16(d, 0x1a);
             int size = BitConverter.ToInt32(d, 0x1c);
-            int bpp = format == 0xe608 ? 4 : format == 0xc600 ? 3 : (format == 0x6208 || format == 0x8400) ? 2 : 1;
-            if (w <= 0 || h <= 0 || size != w * h * bpp) throw new InvalidDataException("Unexpected .rfi layout");
-
+            // Bytes per pixel follow from the unpacked size; the format code only confirms it.
+            int bpp = w > 0 && h > 0 && size > 0 && size % (w * h) == 0 ? size / (w * h) : 0;
+            if (bpp < 1 || bpp > 4)
+                throw new InvalidDataException(string.Format("unsupported image ({0}x{1}, format 0x{2:X8}, flags 0x{3:X4}, {4} bytes unpacked)",
+                                                             w, h, rawFormat, flags, size));
             var raw = new byte[size];
             int i = 0x20, o = 0;
             if ((flags & 0x4000) == 0) Buffer.BlockCopy(d, i, raw, 0, size);
@@ -224,39 +227,69 @@ namespace ExanimaLauncher
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExanimaLauncher");
         public static string BackgroundPath { get { return Path.Combine(CacheDir, "menu_background.png"); } }
 
+        // Where the alpha (ink) of a pixel is: the only byte, or the last one.
+        static int AlphaChannel(int bpp)
+        {
+            return bpp == 1 ? 0 : bpp == 3 ? 0 : bpp - 1;
+        }
+
+        static void Fail(string file, Exception ex)
+        {
+            string message = file + ": " + ex.Message;
+            Error = Error == null ? message : Error + "; " + message;
+        }
+
         public static void Load(string gameDir)
         {
-            try
+            // Each picture is loaded on its own, so one that cannot be read does not take the others
+            // with it. Channels are picked by the bytes per pixel actually found in the file.
+            Rpk rpk = null;
+            try { rpk = new Rpk(Path.Combine(gameDir, "Resource.rpk")); }
+            catch (Exception ex) { Error = "Resource.rpk: " + ex.Message; }
+            if (rpk != null)
             {
-                var rpk = new Rpk(Path.Combine(gameDir, "Resource.rpk"));
+                try
+                {
+                    // Body font: 16 x 16 cells of 64 px, Windows-1252 order starting in the bottom row; alpha only.
+                    var body = RfiImage.Decode(rpk.Read("fontbase24r.rfi"));
+                    int a = AlphaChannel(body.Bpp);
+                    var bodySheet = body.ToBitmap((p, o) => (p[o + a] << 24) | 0xFFFFFF);
+                    var cp = Encoding.GetEncoding(1252);
+                    var chars = new StringBuilder();
+                    for (int n = 0; n < 256; n++) chars.Append(n < 32 ? '\0' : cp.GetChars(new[] { (byte)n })[0]);
+                    Body = new GlyphFont(bodySheet, 64, chars.ToString(), (x, y) => body.Pixels[(y * body.Width + x) * body.Bpp + a],
+                                         18f, 3f, false, true);
+                }
+                catch (Exception ex) { Fail("fontbase24r.rfi", ex); }
 
-                // Body font: 16 x 16 cells of 64 px, Windows-1252 order starting in the bottom row; alpha only.
-                var body = RfiImage.Decode(rpk.Read("fontbase24r.rfi"));
-                var bodySheet = body.ToBitmap((p, o) => (p[o] << 24) | 0xFFFFFF);
-                var cp = Encoding.GetEncoding(1252);
-                var chars = new StringBuilder();
-                for (int n = 0; n < 256; n++) chars.Append(n < 32 ? '\0' : cp.GetChars(new[] { (byte)n })[0]);
-                Body = new GlyphFont(bodySheet, 64, chars.ToString(), (x, y) => body.Pixels[y * body.Width + x], 18f, 3f, false, true);
+                try
+                {
+                    // Title font: 4 x 8 cells of 128 px, capitals; channel 0 = metallic shading, alpha (with glow) last.
+                    var title = RfiImage.Decode(rpk.Read("titlefont.rfi"));
+                    int a = AlphaChannel(title.Bpp), bpp = title.Bpp;
+                    var titleSheet = title.ToBitmap((p, o) =>
+                    {
+                        int lum = bpp == 1 ? 255 : p[o];
+                        return (p[o + a] << 24) | (lum << 16) | (lum << 8) | lum;
+                    });
+                    Title = new GlyphFont(titleSheet, 128, "ABCDEFGHIJKLMNOPQRSTUVWXYZ+",
+                                          (x, y) => title.Pixels[(y * title.Width + x) * bpp], 40f, 6f, true, false);
+                }
+                catch (Exception ex) { Fail("titlefont.rfi", ex); }
 
-                // Title font: 4 x 8 cells of 128 px, capitals; channel 0 = metallic shading, 1 = alpha with glow.
-                var title = RfiImage.Decode(rpk.Read("titlefont.rfi"));
-                var titleSheet = title.ToBitmap((p, o) => (p[o + 1] << 24) | (p[o] << 16) | (p[o] << 8) | p[o]);
-                Title = new GlyphFont(titleSheet, 128, "ABCDEFGHIJKLMNOPQRSTUVWXYZ+", (x, y) => title.Pixels[(y * title.Width + x) * 2], 40f, 6f, true, false);
-
-                var logo = RfiImage.Decode(rpk.Read("maintitle01.rfi"));
-                Logo = logo.ToBitmap((p, o) => logo.Bpp == 4
-                    ? (p[o + 3] << 24) | (p[o + 2] << 16) | (p[o + 1] << 8) | p[o]
-                    : (255 << 24) | (p[o] << 16) | (p[o] << 8) | p[o]);
+                try
+                {
+                    var logo = RfiImage.Decode(rpk.Read("maintitle01.rfi"));
+                    Logo = logo.ToBitmap((p, o) => logo.Bpp == 4 ? (p[o + 3] << 24) | (p[o + 2] << 16) | (p[o + 1] << 8) | p[o]
+                                                 : logo.Bpp == 3 ? (255 << 24) | (p[o + 2] << 16) | (p[o + 1] << 8) | p[o]
+                                                                 : (255 << 24) | (p[o] << 16) | (p[o] << 8) | p[o]);
+                }
+                catch (Exception ex) { Fail("maintitle01.rfi", ex); }
             }
-            catch (Exception ex)
-            {
-                Body = Title = null;
-                Logo = null;
-                Error = ex.Message;
-            }
 
-            // The main-menu scene is rendered by the game, so it is captured from a game session into
-            // a local cache (see MODDING.md); without it the launcher uses a plain dark background.
+            // The main-menu scene is rendered by the game: the mod loader (winmm.dll) takes a picture of
+            // it the first time the game reaches its main menu, into a local cache. Until then the
+            // launcher uses a plain dark background.
             try
             {
                 if (File.Exists(BackgroundPath))
